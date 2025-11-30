@@ -14,18 +14,25 @@ API_KEY = os.environ.get("API_KEY", "")
 APP_NAME = os.environ.get("APP_NAME", "p910nd")         # nazwa appki w SCALE (jeśli istnieje)
 DOCKER_CONTAINER = os.environ.get("DOCKER_CONTAINER", "p910nd")
 
-# Uniwersalne dopasowanie drukarki:
-# Domyślnie: "usblp" (czyli dowolne urządzenie, które zarejestruje sterownik usblp – każda drukarka USB)
-USB_EVENT_MATCH_ANY_OF = [
+# Wzorce "podłączenia" drukarki – domyślnie usblp / USB Bidirectional printer
+USB_ATTACH_MATCH_ANY_OF = [
     token.strip() for token in os.environ.get(
-        "USB_EVENT_MATCH_ANY_OF",
+        "USB_ATTACH_MATCH_ANY_OF",
         "usblp,USB Bidirectional printer"
     ).split(",")
     if token.strip()
 ]
 
+# Wzorce "odłączenia" – domyślnie ogólne "USB disconnect"
+USB_DETACH_MATCH_ANY_OF = [
+    token.strip() for token in os.environ.get(
+        "USB_DETACH_MATCH_ANY_OF",
+        "USB disconnect"
+    ).split(",")
+    if token.strip()
+]
+
 SSL_VERIFY = os.environ.get("SSL_VERIFY", "false").lower() == "true"
-COOLDOWN_SECONDS = float(os.environ.get("COOLDOWN_SECONDS", "10"))
 
 # Logowanie
 LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").upper()
@@ -206,13 +213,22 @@ def handle_printer_event():
 
 # ========== NASŁUCH DMESG ==========
 
-def line_matches_printer_event(line: str) -> bool:
+def line_is_attach(line: str) -> bool:
     """
-    Uniwersalne wykrywanie: jeśli jakikolwiek token z USB_EVENT_MATCH_ANY_OF
-    występuje w linii dmesg – uznajemy, że to zdarzenie drukarki.
-    Domyślnie: 'usblp' lub 'USB Bidirectional printer'.
+    Czy linia dmesg wygląda jak 'podłączenie' drukarki.
     """
-    for token in USB_EVENT_MATCH_ANY_OF:
+    for token in USB_ATTACH_MATCH_ANY_OF:
+        if token in line:
+            return True
+    return False
+
+
+def line_is_detach(line: str) -> bool:
+    """
+    Czy linia dmesg wygląda jak 'odłączenie' urządzenia USB.
+    Domyślnie po prostu 'USB disconnect'.
+    """
+    for token in USB_DETACH_MATCH_ANY_OF:
         if token in line:
             return True
     return False
@@ -220,11 +236,15 @@ def line_matches_printer_event(line: str) -> bool:
 
 def follow_dmesg():
     """
-    Nasłuchuje 'dmesg --follow --human' i reaguje, gdy pojawi się linia
-    zawierająca którykolwiek z USB_EVENT_MATCH_ANY_OF.
-    Wymaga dostępu do /dev/kmsg i odpowiednich uprawnień (privileged / CAP_SYSLOG).
+    Nasłuchuje 'dmesg --follow --human' i:
+    - przy pierwszym "attach" po stanie "odłączona" → restartuje p910nd i oznacza drukarkę jako podłączoną,
+    - przy "detach" → oznacza drukarkę jako odłączoną (bez restartu).
+    Dzięki temu jest jeden restart na każde faktyczne podłączenie drukarki.
     """
-    logger.info(f"Start nasłuchu dmesg. Wzorce USB: {USB_EVENT_MATCH_ANY_OF}")
+    logger.info(
+        f"Start nasłuchu dmesg. "
+        f"Wzorce attach: {USB_ATTACH_MATCH_ANY_OF}, wzorce detach: {USB_DETACH_MATCH_ANY_OF}"
+    )
 
     if not shutil.which("dmesg"):
         logger.error("Brak 'dmesg' w kontenerze – zainstaluj kmod lub util-linux.")
@@ -238,7 +258,7 @@ def follow_dmesg():
         bufsize=1,
     )
 
-    last_trigger_time = 0.0
+    printer_attached = False
 
     try:
         for raw_line in proc.stdout:
@@ -249,14 +269,24 @@ def follow_dmesg():
             # Możesz odkomentować do debugowania:
             # logger.debug(f"[DMESG] {line}")
 
-            if line_matches_printer_event(line):
-                now = time.time()
-                if now - last_trigger_time > COOLDOWN_SECONDS:
-                    logger.info(f"Wykryto zdarzenie drukarki w linii: {line}")
+            if line_is_attach(line):
+                if not printer_attached:
+                    logger.info(f"Wykryto PODŁĄCZENIE drukarki w linii: {line}")
                     handle_printer_event()
-                    last_trigger_time = now
+                    printer_attached = True
                 else:
-                    logger.info("Dodatkowe dopasowanie w czasie cooldownu – pomijam.")
+                    logger.info(
+                        "Wykryto linię 'attach', ale drukarka jest już oznaczona jako podłączona – pomijam."
+                    )
+            elif line_is_detach(line):
+                if printer_attached:
+                    logger.info(f"Wykryto ODLĄCZENIE urządzenia w linii: {line} – oznaczam jako odłączone.")
+                else:
+                    logger.info(
+                        f"Wykryto linię 'detach' ({line}), ale drukarka już oznaczona jako odłączona."
+                    )
+                printer_attached = False
+
     finally:
         proc.terminate()
         try:
