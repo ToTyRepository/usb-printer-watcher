@@ -107,26 +107,81 @@ def restart_via_truenas(app_name: str) -> bool:
 
 # ========== Docker (docker.sock) ==========
 
-def restart_via_docker(container_name: str) -> bool:
-    if not shutil.which("docker"):
-        logger.warning("Brak binarki 'docker' w kontenerze – nie mogę zrestartować kontenera Dockera.")
-        return False
-
+def resolve_container_name(pattern: str) -> str | None:
+    """
+    Szuka kontenera Dockera po nazwie.
+    - najpierw próbuje dokładne dopasowanie (name == pattern),
+    - jeśli brak, szuka nazw zawierających pattern jako substring.
+    Zwraca nazwę kontenera albo None.
+    """
     try:
         result = subprocess.run(
-            ["docker", "restart", container_name],
+            ["docker", "ps", "--format", "{{.Names}}"],
             check=True,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
         )
-        logger.info(f"Zrestartowano kontener Docker '{container_name}'. Wyjście:\n{result.stdout.strip()}")
+    except subprocess.CalledProcessError as e:
+        logger.error(f"Nie udało się pobrać listy kontenerów Dockera: {e.stdout}")
+        return None
+    except Exception as e:
+        logger.error(f"Wyjątek przy pobieraniu listy kontenerów Dockera: {e}")
+        return None
+
+    names = [line.strip() for line in result.stdout.splitlines() if line.strip()]
+    if not names:
+        logger.error("Brak uruchomionych kontenerów Dockera.")
+        return None
+
+    # 1. dokładne dopasowanie
+    if pattern in names:
+        logger.info(f"Znaleziono dokładne dopasowanie kontenera Dockera: '{pattern}'.")
+        return pattern
+
+    # 2. dopasowanie przez 'pattern w nazwie'
+    matches = [name for name in names if pattern in name]
+    if len(matches) == 1:
+        logger.info(f"Znaleziono jedno dopasowanie kontenera zawierające '{pattern}': '{matches[0]}'.")
+        return matches[0]
+    elif len(matches) == 0:
+        logger.error(f"Nie znaleziono kontenera z nazwą zawierającą '{pattern}'. "
+                     f"Dostępne kontenery: {names}")
+        return None
+    else:
+        logger.error(f"Znaleziono wiele kontenerów zawierających '{pattern}': {matches}. "
+                     f"Doprecyzuj zmienną DOCKER_CONTAINER.")
+        return None
+
+
+def restart_via_docker(container_pattern: str) -> bool:
+    if not shutil.which("docker"):
+        logger.warning("Brak binarki 'docker' w kontenerze – nie mogę zrestartować kontenera Dockera.")
+        return False
+
+    resolved_name = resolve_container_name(container_pattern)
+    if not resolved_name:
+        # komunikaty błędu już zostały zalogowane w resolve_container_name
+        return False
+
+    try:
+        result = subprocess.run(
+            ["docker", "restart", resolved_name],
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+        )
+        logger.info(
+            f"Zrestartowano kontener Docker '{resolved_name}' (wzorzec: '{container_pattern}'). "
+            f"Wyjście:\n{result.stdout.strip()}"
+        )
         return True
     except subprocess.CalledProcessError as e:
-        logger.error(f"Błąd przy 'docker restart {container_name}': {e.stdout}")
+        logger.error(f"Błąd przy 'docker restart {resolved_name}': {e.stdout}")
         return False
     except Exception as e:
-        logger.error(f"Wyjątek przy restarcie Dockera '{container_name}': {e}")
+        logger.error(f"Wyjątek przy restarcie Dockera '{resolved_name}': {e}")
         return False
 
 
