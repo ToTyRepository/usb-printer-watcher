@@ -51,19 +51,19 @@ logger.setLevel(LOG_LEVEL)
 
 fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
 
-# stdout (zawsze) – widoczne w `docker logs` / logach aplikacji w TrueNAS
+# stdout (zawsze)
 sh = logging.StreamHandler()
 sh.setFormatter(fmt)
 logger.addHandler(sh)
 
-# log do pliku w kontenerze (opcjonalnie)
+# log do pliku (opcjonalnie)
 if LOG_TO_FILE:
     os.makedirs(os.path.dirname(LOG_FILE_PATH), exist_ok=True)
     fh = logging.FileHandler(LOG_FILE_PATH)
     fh.setFormatter(fmt)
     logger.addHandler(fh)
 
-# syslog (opcjonalnie; wymaga działającego sysloga pod `SYSLOG_ADDRESS`, zwykle /dev/log)
+# syslog (opcjonalnie)
 if LOG_TO_SYSLOG:
     try:
         syslog_handler = SysLogHandler(address=SYSLOG_ADDRESS)
@@ -114,12 +114,11 @@ def restart_via_truenas(app_name: str) -> bool:
 
 # ========== Docker (docker.sock) ==========
 
-def resolve_container_name(pattern: str) -> str | None:
+def resolve_container_name(pattern: str):
     """
     Szuka kontenera Dockera po nazwie.
-    - najpierw próbuje dokładne dopasowanie (name == pattern),
-    - jeśli brak, szuka nazw zawierających pattern jako substring.
-    Zwraca nazwę kontenera albo None.
+    - dokładne dopasowanie (name == pattern),
+    - albo nazwa zawierająca pattern.
     """
     try:
         result = subprocess.run(
@@ -168,7 +167,6 @@ def restart_via_docker(container_pattern: str) -> bool:
 
     resolved_name = resolve_container_name(container_pattern)
     if not resolved_name:
-        # komunikaty błędu już zostały zalogowane w resolve_container_name
         return False
 
     try:
@@ -216,7 +214,13 @@ def handle_printer_event():
 def line_is_attach(line: str) -> bool:
     """
     Czy linia dmesg wygląda jak 'podłączenie' drukarki.
+    - musi zawierać któryś z tokenów USB_ATTACH_MATCH_ANY_OF,
+    - ale NIE może zawierać słów typu 'removed'/'disconnect' (to bardziej 'detach').
     """
+    lower = line.lower()
+    if "removed" in lower or "disconnect" in lower:
+        return False
+
     for token in USB_ATTACH_MATCH_ANY_OF:
         if token in line:
             return True
@@ -226,25 +230,56 @@ def line_is_attach(line: str) -> bool:
 def line_is_detach(line: str) -> bool:
     """
     Czy linia dmesg wygląda jak 'odłączenie' urządzenia USB.
-    Domyślnie po prostu 'USB disconnect'.
     """
+    lower = line.lower()
+    # ogólny przypadek – odłączenie USB
+    if "usb disconnect" in lower:
+        return True
+    # specyficznie linie typu "usblp0: removed", "usblp1: removed", itp.
+    if "usblp" in lower and "removed" in lower:
+        return True
+
     for token in USB_DETACH_MATCH_ANY_OF:
         if token in line:
             return True
     return False
 
 
+def get_last_dmesg_line() -> str | None:
+    """
+    Zwraca ostatnią linię aktualnego bufora dmesg.
+    Używane jako marker, żeby pominąć starą historię przy starcie.
+    """
+    try:
+        proc = subprocess.run(
+            ["dmesg", "--human"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            check=True,
+        )
+        lines = [l.strip() for l in proc.stdout.splitlines() if l.strip()]
+        if lines:
+            return lines[-1]
+        return None
+    except Exception as e:
+        logger.warning(f"Nie udało się pobrać ostatniej linii dmesg: {e}")
+        return None
+
+
 def follow_dmesg():
     """
     Nasłuchuje 'dmesg --follow --human' i:
-    - przy pierwszym "attach" po stanie "odłączona" → restartuje p910nd i oznacza drukarkę jako podłączoną,
-    - przy "detach" → oznacza drukarkę jako odłączoną (bez restartu).
-    Dzięki temu jest jeden restart na każde faktyczne podłączenie drukarki.
+    - IGNORUJE cały stary bufor dmesg (tylko nowe wpisy po starcie),
+    - przy pierwszym 'attach' po stanie 'odłączona' → restartuje p910nd,
+    - przy 'detach' → oznacza drukarkę jako odłączoną (bez restartu).
     """
-    logger.info(
-        f"Start nasłuchu dmesg. "
-        f"Wzorce attach: {USB_ATTACH_MATCH_ANY_OF}, wzorce detach: {USB_DETACH_MATCH_ANY_OF}"
-    )
+
+    marker = get_last_dmesg_line()
+    if marker:
+        logger.info(f"Marker końca starego bufora dmesg przy starcie: {marker}")
+    else:
+        logger.info("Brak markera dmesg – będę przetwarzał wszystkie nowe linie od razu.")
 
     if not shutil.which("dmesg"):
         logger.error("Brak 'dmesg' w kontenerze – zainstaluj kmod lub util-linux.")
@@ -258,6 +293,10 @@ def follow_dmesg():
         bufsize=1,
     )
 
+    skipping_old = marker is not None
+    skip_start_time = time.time()
+    SKIP_TIMEOUT = 15.0  # maksymalnie 15 s na znalezienie markera, potem przetwarzamy wszystko
+
     printer_attached = False
 
     try:
@@ -266,8 +305,21 @@ def follow_dmesg():
             if not line:
                 continue
 
-            # Możesz odkomentować do debugowania:
-            # logger.debug(f"[DMESG] {line}")
+            # Faza 1: ignorujemy całą starą historię dmesg aż do markera
+            if skipping_old:
+                if line == marker:
+                    skipping_old = False
+                    logger.info("Osiągnięto marker końca starego bufora dmesg – "
+                                "od tej chwili reaguję tylko na nowe wpisy.")
+                else:
+                    # timeout awaryjny – gdyby marker z jakiegoś powodu nie pojawił się
+                    if time.time() - skip_start_time > SKIP_TIMEOUT:
+                        skipping_old = False
+                        logger.warning("Nie znaleziono markera w strumieniu dmesg, "
+                                       "przestaję ignorować wpisy i zaczynam je przetwarzać.")
+                continue
+
+            # Od tego miejsca reagujemy tylko na NOWE wpisy dmesg (po starcie skryptu)
 
             if line_is_attach(line):
                 if not printer_attached:
